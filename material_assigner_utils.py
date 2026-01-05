@@ -1,3 +1,4 @@
+# Copyright (c) 2026-Present Nehon (github.com/Nehon)
 """
 Material Assigner Utilities for Unreal Engine 5.7
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026-Present Nehon (github.com/Nehon)
 """
 Material Assigner - Blueprint Integration
 
