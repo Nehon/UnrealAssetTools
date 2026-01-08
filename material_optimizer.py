@@ -58,8 +58,8 @@ from typing import Optional, List, Dict, Any
 # =============================================================================
 
 DEFAULT_PATTERNS = {
-    "BaseColor": ["_BaseColor", "_Diffuse", "_Albedo", "_Color", "_Base_Color","_BC", "_D", "_diff"],
-    "Normal": ["_Normal", "_Nrm", "_N", "_NormalMap", "_norm"],
+    "BaseColor": ["_BaseColor", "_Diffuse", "_Albedo", "_Color", "_Base_Color","_BC", "_D", "_diff", "_B"],
+    "Normal": ["_Normal", "_Nrm", "_N", "_NormalMap", "_norm", "_NM"],
     "Roughness": ["_Roughness", "_Rough", "_R", "_roughness"],
     "Metallic": ["_Metallic", "_Metal", "_M", "_metallic", "_Metalness"],
     "AO": ["_AO", "_Occlusion", "_AmbientOcclusion", "_O", "_ao"],
