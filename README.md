@@ -2,6 +2,24 @@
 
 An Unreal Engine Editor Utility for batch-creating optimized Material Instances from static mesh materials. Analyzes texture dependencies, creates MIs parented to a master material, and assigns textures automatically.
 
+## Disclaimer
+This is a tool I use for myself, in conjunction with the [Dash](https://www.polygonflow.io/) plugin master materials, howver it can work with any master
+material as long as the name of the parameters are somhow conventional (see the MATERIAL_PARAMETER_NAMES dict in materiaoptimizer.py).
+
+This tool is given as is, under MIT license, you can do whatever you want with it, but I may drop maintenance any time if I don't need it anymore
+
+## Why?
+If you bought / got for free a lot of assets packs on fab or anywhere else, you may have, like I do, hundreds of them.
+
+Each pack comes with its own master material(s) and when you use the assets in a scene you will end up with hundreds of materials to compile x plenty eventual shader permutation for each one of them.
+This will make the shader compilation time skyrocket and may introduce the dreaded micro freeze of unreal.
+
+Also when you want to add some variations to the materials, like snow / wetness /rain (what the dash plugin provides in its stock materials), you'd have to modify everyone of your hundreds materials to support it and adding again a lot more shader permutations.
+
+This tool aims at reducing this issue by converting any assets to use the same master material (or few master materials) in few click.
+
+**It's not magic**, as some materials will be too complex or specific to convert them. But most of the time you will drastically reduce the number of shaders to compile using this tool.
+
 ## Features
 
 - Batch process multiple static meshes from Content Browser selection
@@ -25,17 +43,30 @@ An Unreal Engine Editor Utility for batch-creating optimized Material Instances 
 [/Script/PythonScriptPlugin.PythonScriptPluginSettings]
 +AdditionalPaths=(Path="Content/__AssetTools")
 ```
-3. Restart the editor to load Python modules
+(you may need to use the absolute path from the root of the hard drive)\
+Alternatively you can configure this in the Project settings, search for "Python" and add an entry in the "Additional Paths" array
+![config.jpg](resources/config.jpg)
+4. Restart the editor to load Python modules
 
 ## Usage
 
 1. Select one or more Static Meshes in the Content Browser
 2. Right-click and choose **Scripted Asset Actions > Optimize Assets**
+   ![rightclick.jpg](resources/rightclick.jpg)
 3. In the popup:
    - Configure master material paths
+   - Click on "Analyze"
    - Review analyzed meshes and their texture assignments
    - Resolve any conflicts (multiple textures matching same channel)
    - Skip channels or meshes as needed
+    ![dialog.jpg](resources/dialog.jpg)
+         1. Click on the mesh thumbnail to open the mesh editor   
+         2. Click on the texture thumbnail to open the texture editor \
+         3. Click on a chanel check box to disable it (skipped during processing) \
+         4. Pick on of the proposed textures. the % is the "confidence" level of the tool that this is the right texture. It can go over 100% in which case you ca be pretty sure it' sthe right one.\
+         5. You can decide to keep the origial material for a given material slot (if the material is too complex, you may not be able to cnvert it)\
+         6. You can decide to skip the whole static mesh if materials are too complex\
+         The console at the bottom displays the processing json, it's just a convenient debugging comodity.
 4. Click **Process** to create Material Instances
 
 ## File Structure
