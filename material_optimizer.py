@@ -58,8 +58,8 @@ from typing import Optional, List, Dict, Any
 # =============================================================================
 
 DEFAULT_PATTERNS = {
-    "BaseColor": ["_BaseColor", "_Diffuse", "_Albedo", "_Color", "_Base_Color","_BC", "_D", "_diff", "_B"],
-    "Normal": ["_Normal", "_Nrm", "_N", "_NormalMap", "_norm", "_NM"],
+    "BaseColor": ["_BaseColor", "_Diffuse", "_Albedo", "_Color", "_Base_Color","_BC", "_d", "_diff", "_B"],
+    "Normal": ["_Normal", "_Nrm", "_N", "_NormalMap", "_norm", "_NM", "_nor"],
     "Roughness": ["_Roughness", "_Rough", "_R", "_roughness"],
     "Metallic": ["_Metallic", "_Metal", "_M", "_metallic", "_Metalness"],
     "AO": ["_AO", "_Occlusion", "_AmbientOcclusion", "_O", "_ao"],
@@ -86,7 +86,7 @@ MATERIAL_PARAMETER_NAMES = {
 
 # Parameter names for ORM master material
 MATERIAL_PARAMETER_NAMES_ORM = {
-    "BaseColor": ["BaseColor",  "BaseColorMap", "Base Color", "Diffuse", "Albedo", "Color"],
+    "BaseColor": ["BaseColor", "BaseColorMap", "Base Color", "Base Color Map", "Diffuse", "DiffuseMap", "Diffuse Map", "Albedo", "AlbedoMap", "Albedo Map", "Color", "ColorMap", "Color Map"],
     "Normal": ["Normal", "NormalMap", "Normal Map"],
     "ORM": ["ORM Map", "ORM", "ARM", "OcclusionRoughnessMetallic", "PackedTexture"],
     "Emissive": ["Emissive", "Emission", "EmissiveMap", "EmissionMap", "EmissiveColor"]
@@ -435,65 +435,40 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         candidates: Dict[str, List[Dict[str, Any]]] = {}
     
         # First pass: collect all matching textures per type
+        # A texture can match multiple types - we check ALL patterns for ALL types
         for texture in textures:
             tex_name = texture.get_name()
             tex_path = texture.get_path_name()
             if '.' in tex_path:
                 tex_path = tex_path.split('.')[0]
-    
+
             tex_name_lower = tex_name.lower()
-    
-            # Check for ORM patterns first if enabled
+            matched_types = set()  # Track which types this texture matched
+
+            # Check for ORM patterns if enabled
             if include_orm:
                 for pattern in ORM_PATTERNS:
                     if pattern.lower() in tex_name_lower:
-                        if 'ORM' not in candidates:
-                            candidates['ORM'] = []
-                        candidates['ORM'].append({
-                            'name': tex_name,
-                            'path': tex_path,
-                            'confidence': 0.0,
-                            'selected': False
-                        })
-                        break
-                else:
-                    # No ORM pattern matched, check standard patterns
-                    for tex_type, pattern_list in patterns.items():
-                        for pattern in pattern_list:
-                            if pattern.lower() in tex_name_lower:
-                                if tex_type not in candidates:
-                                    candidates[tex_type] = []
-                                candidates[tex_type].append({
-                                    'name': tex_name,
-                                    'path': tex_path,
-                                    'confidence': 0.0,
-                                    'selected': False
-                                })
-                                break
-                        else:
-                            # Inner loop completed without match, try next tex_type
-                            continue
-                        # Inner loop broke (pattern matched), stop checking other types
-                        break
-            else:
-                # Standard patterns only
-                for tex_type, pattern_list in patterns.items():
-                    for pattern in pattern_list:
-                        if pattern.lower() in tex_name_lower:
-                            if tex_type not in candidates:
-                                candidates[tex_type] = []
-                            candidates[tex_type].append({
-                                'name': tex_name,
-                                'path': tex_path,
-                                'confidence': 0.0,
-                                'selected': False
-                            })
-                            break
-                    else:
-                        # Inner loop completed without match, try next tex_type
-                        continue
-                    # Inner loop broke (pattern matched), stop checking other types
-                    break
+                        matched_types.add('ORM')
+                        break  # Only need one ORM pattern match
+
+            # Check ALL standard patterns (don't skip after first match)
+            for tex_type, pattern_list in patterns.items():
+                for pattern in pattern_list:
+                    if pattern.lower() in tex_name_lower:
+                        matched_types.add(tex_type)
+                        break  # One pattern match per type is enough
+
+            # Add texture to all matched types
+            for tex_type in matched_types:
+                if tex_type not in candidates:
+                    candidates[tex_type] = []
+                candidates[tex_type].append({
+                    'name': tex_name,
+                    'path': tex_path,
+                    'confidence': 0.0,
+                    'selected': False
+                })
     
         # Second pass: calculate confidence scores
         for tex_type, tex_list in candidates.items():
@@ -516,11 +491,34 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     
             # Sort by confidence descending
             tex_list.sort(key=lambda x: x['confidence'], reverse=True)
-    
+
             # Auto-select the first (highest confidence) if >= 1.0
             if tex_list and tex_list[0]['confidence'] >= 1.0:
                 tex_list[0]['selected'] = True
-    
+
+        # Third pass: remove textures from channels where they have low confidence
+        # if they have >= 1.0 confidence in another channel
+        # Build a map of textures that have high confidence in at least one channel
+        high_confidence_assignments: Dict[str, str] = {}  # tex_path -> tex_type with high confidence
+        for tex_type, tex_list in candidates.items():
+            for tex_entry in tex_list:
+                if tex_entry['confidence'] >= 1.0:
+                    tex_path = tex_entry['path']
+                    # Only record if not already recorded (first high-confidence wins)
+                    if tex_path not in high_confidence_assignments:
+                        high_confidence_assignments[tex_path] = tex_type
+
+        # Remove textures from other channels if they have high confidence elsewhere
+        for tex_type, tex_list in list(candidates.items()):
+            candidates[tex_type] = [
+                tex_entry for tex_entry in tex_list
+                if tex_entry['path'] not in high_confidence_assignments
+                or high_confidence_assignments[tex_entry['path']] == tex_type
+            ]
+            # Remove empty channels
+            if not candidates[tex_type]:
+                del candidates[tex_type]
+
         return candidates
 
     @staticmethod
@@ -620,15 +618,22 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     
         # Build skipped_channels: false for each detected channel (user can set to true to skip)
         slot_analysis['skipped_channels'] = {tex_type: False for tex_type in candidates.keys()}
-    
-        # Check for conflicts (more than one candidate per type)
+
+        # Check for conflicts (more than one candidate per type) and unselected channels
+        unselected_channels = []
         for tex_type, tex_list in candidates.items():
             if len(tex_list) > 1:
                 slot_analysis['has_conflicts'] = True
                 slot_analysis['conflict_types'].append(tex_type)
+            # Check if any texture is selected for this channel
+            has_selection = any(tex.get('selected', False) for tex in tex_list)
+            if not has_selection:
+                unselected_channels.append(tex_type)
 
-        # Calculate total_issues: number of conflicts (incompatibilities already handled above)
-        slot_analysis['total_issues'] = len(slot_analysis['conflict_types'])
+        # Calculate total_issues: conflicts + unselected channels (no texture with confidence >= 1.0)
+        # Note: conflicts are a subset of unselected (if multiple candidates, none auto-selected means conflict)
+        # So we just count unselected_channels which includes both cases
+        slot_analysis['total_issues'] = len(unselected_channels)
 
         return slot_analysis
 
@@ -1137,16 +1142,22 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 if success:
                     assigned_count += 1
                     unreal.log(f"    {tex_type}: {texture.get_name()}")
+                else:
+                    unreal.log_warning(f"    {tex_type}: Failed to assign {texture.get_name()} to parameter '{param_name}'")
             else:
                 direct_names = param_names.get(tex_type, [tex_type])
+                assigned = False
                 for name in direct_names:
                     success = unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
                         material_instance, name, texture
                     )
                     if success:
                         assigned_count += 1
+                        assigned = True
                         unreal.log(f"    {tex_type}: {texture.get_name()}")
                         break
+                if not assigned:
+                    unreal.log_warning(f"    {tex_type}: No matching parameter found in material for {texture.get_name()}")
 
         return assigned_count
 
@@ -1294,6 +1305,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
 
             if mesh_analysis['has_any_conflicts']:
                 result['meshes_with_conflicts'] += 1
+
+            # Can't auto-process if there are any issues (conflicts or unselected channels)
+            if mesh_analysis['total_issues'] > 0:
                 result['can_auto_process'] = False
 
         unreal.log(f"Analysis complete: {len(meshes)} meshes, {result['total_issues']} issues")
@@ -1463,8 +1477,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                                 matched[tex_type] = texture
                             else:
                                 unreal.log_warning(f"  Texture not found: {selected_tex['path']}")
-                        elif len(tex_list) > 1:
-                            # Conflict not resolved
+                        elif len(tex_list) >= 1:
+                            # No texture selected for this channel - needs user selection
                             unresolved_conflicts.append(tex_type)
     
                     # Skip if there are unresolved conflicts
