@@ -75,6 +75,35 @@ RMA_PATTERNS = ["_RMA", "_RoughnessMetallicAO", "_RoughnessMetalAO"]
 # Patterns for RAM packed textures (INCOMPATIBLE - different channel order: Roughness(R), AO(B),  Metallic(G),)
 RAM_PATTERNS = ["_RAM", "_RoughnessAOMetallic", "_RoughnessAOMetal", "-RAM", "RAM_"]
 
+
+def pattern_matches_full_word(texture_name_lower: str, pattern_lower: str) -> bool:
+    """Check if pattern matches as a full word/suffix in texture name.
+
+    Prevents false positives like "_d" matching "_dx" or "_r" matching "_rock".
+    Pattern matches if it's found in the texture name and is NOT immediately
+    followed by a letter (a-z).
+
+    Args:
+        texture_name_lower: Lowercase texture name to search in
+        pattern_lower: Lowercase pattern to search for
+
+    Returns:
+        True if pattern matches as a complete suffix/word
+    """
+    idx = texture_name_lower.find(pattern_lower)
+    while idx != -1:
+        end_idx = idx + len(pattern_lower)
+        # Check if pattern is at end of string or followed by non-letter
+        if end_idx >= len(texture_name_lower):
+            return True  # Pattern is at the end
+        next_char = texture_name_lower[end_idx]
+        if not next_char.isalpha():
+            return True  # Pattern is followed by non-letter (digit, underscore, etc.)
+        # Look for next occurrence
+        idx = texture_name_lower.find(pattern_lower, end_idx)
+    return False
+
+
 MATERIAL_PARAMETER_NAMES = {
     "BaseColor": ["BaseColor",  "BaseColorMap", "Base Color", "Diffuse", "Albedo", "Color"],
     "Normal": ["Normal", "NormalMap", "Normal Map"],
@@ -359,21 +388,21 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         """
         for texture in textures:
             tex_name = texture.get_name().lower()
-    
+
             # Check for ORM/ARM patterns first (compatible)
             for pattern in ORM_PATTERNS:
-                if pattern.lower() in tex_name:
+                if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "ORM"
-    
+
             # Check for RMA patterns (incompatible)
             for pattern in RMA_PATTERNS:
-                if pattern.lower() in tex_name:
+                if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "RMA"
-    
+
             for pattern in RAM_PATTERNS:
-                if pattern.lower() in tex_name:
+                if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "RAM"
-    
+
         return "STANDARD"
     
     
@@ -448,14 +477,14 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             # Check for ORM patterns if enabled
             if include_orm:
                 for pattern in ORM_PATTERNS:
-                    if pattern.lower() in tex_name_lower:
+                    if pattern_matches_full_word(tex_name_lower, pattern.lower()):
                         matched_types.add('ORM')
                         break  # Only need one ORM pattern match
 
             # Check ALL standard patterns (don't skip after first match)
             for tex_type, pattern_list in patterns.items():
                 for pattern in pattern_list:
-                    if pattern.lower() in tex_name_lower:
+                    if pattern_matches_full_word(tex_name_lower, pattern.lower()):
                         matched_types.add(tex_type)
                         break  # One pattern match per type is enough
 
@@ -495,6 +524,15 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             # Auto-select the first (highest confidence) if >= 1.0
             if tex_list and tex_list[0]['confidence'] >= 1.0:
                 tex_list[0]['selected'] = True
+
+        # If ORM texture is detected with high confidence, skip Roughness, Metallic, and AO
+        # since ORM already contains all three channels
+        if 'ORM' in candidates:
+            orm_list = candidates['ORM']
+            if orm_list and orm_list[0]['confidence'] >= 1.0:
+                for channel in ['Roughness', 'Metallic', 'AO']:
+                    if channel in candidates:
+                        del candidates[channel]
 
         # Third pass: remove textures from channels where they have low confidence
         # if they have >= 1.0 confidence in another channel
@@ -688,8 +726,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
 
             if not slot_analysis['is_compatible']:
                 mesh_analysis['has_any_incompatibility'] = True
-                # don't add the number of issues if the slot is incompatible, it won't be processed 
-                return mesh_analysis
+                # don't add the number of issues if the slot is incompatible, it won't be processed
+                continue
 
             # Sum up slot issues
             mesh_analysis['total_issues'] += slot_analysis['total_issues']
@@ -816,12 +854,12 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         # Check for ORM patterns first if enabled (before checking individual channels)
         if include_orm:
             for pattern in ORM_PATTERNS:
-                if pattern.lower() in texture_name_lower:
+                if pattern_matches_full_word(texture_name_lower, pattern.lower()):
                     return "ORM"
 
         for tex_type, pattern_list in patterns.items():
             for pattern in pattern_list:
-                if pattern.lower() in texture_name_lower:
+                if pattern_matches_full_word(texture_name_lower, pattern.lower()):
                     return tex_type
 
         return None
