@@ -15,9 +15,16 @@ Key Features:
 - Two-phase workflow: analyze first, then process with user validation
 
 Texture Packing Support:
-- ORM/ARM textures: Occlusion(R), Roughness(G), Metallic(B) - SUPPORTED
-- RMA textures: Roughness(R), Metallic(G), AO(B) - SKIPPED (incompatible channel order)
-- RAM textures: Roughness(R), AO(G), Metallic(B) - SKIPPED (incompatible channel order)
+- ORM/ARM textures: Occlusion(R), Roughness(G), Metallic(B) - NATIVE SUPPORT
+- RMA textures: Roughness(R), Metallic(G), AO(B) - AUTO-REPACK (if swizzle material provided)
+- RAM textures: Roughness(R), AO(G), Metallic(B) - AUTO-REPACK (if swizzle material provided)
+- MRA textures: Metallic(R), Roughness(G), AO(B) - AUTO-REPACK (if swizzle material provided)
+
+Texture Repacking:
+When a swizzle_material_path is provided, textures with incompatible channel orders
+(RMA, RAM, MRA) are automatically repacked to ORM format using GPU rendering.
+This is a format-agnostic system - the swizzle material defines the channel remapping,
+making it extensible to any custom packing format.
 
 Blueprint Usage:
     The BPMaterialOptimizer class exposes two Blueprint-callable functions:
@@ -72,8 +79,11 @@ ORM_PATTERNS = ["_ORM", "_ARM", "_OcclusionRoughnessMetallic", "_AORoughnessMeta
 # Patterns for RMA packed textures (INCOMPATIBLE - different channel order: Roughness(R), Metallic(G), AO(B))
 RMA_PATTERNS = ["_RMA", "_RoughnessMetallicAO", "_RoughnessMetalAO"]
 
-# Patterns for RAM packed textures (INCOMPATIBLE - different channel order: Roughness(R), AO(B),  Metallic(G),)
-RAM_PATTERNS = ["_RAM", "_RoughnessAOMetallic", "_RoughnessAOMetal", "-RAM", "RAM_"]
+# Patterns for RAM packed textures (INCOMPATIBLE - different channel order: Roughness(R), AO(G), Metallic(B))
+RAM_PATTERNS = ["_RAM", "_RoughnessAOMetallic", "_RoughnessAOMetal", "_RoughAOMetal", "-RAM", "RAM_"]
+
+# Patterns for MRA packed textures (INCOMPATIBLE - different channel order: Metallic(R), Roughness(G), AO(B))
+MRA_PATTERNS = ["_MRA", "_MetallicRoughnessAO", "_MetalRoughAO", "_MT_R_AO"]
 
 
 def pattern_matches_full_word(texture_name_lower: str, pattern_lower: str) -> bool:
@@ -375,15 +385,17 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     @staticmethod
     def detect_texture_packing_mode(textures: list) -> str:
         """Detect if textures use ORM/ARM packing or separate channels.
-    
+
         Examines texture names to determine which packing mode is used.
-    
+
         Args:
             textures: List of texture assets to examine
-    
+
         Returns:
             "ORM" if ORM/ARM packed textures detected (compatible)
-            "RMA" if RMA packed textures detected (incompatible - will skip)
+            "RMA" if RMA packed textures detected (requires repacking)
+            "RAM" if RAM packed textures detected (requires repacking)
+            "MRA" if MRA packed textures detected (requires repacking)
             "STANDARD" if separate channel textures (no packed texture found)
         """
         for texture in textures:
@@ -394,14 +406,20 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "ORM"
 
-            # Check for RMA patterns (incompatible)
+            # Check for RMA patterns (requires repacking)
             for pattern in RMA_PATTERNS:
                 if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "RMA"
 
+            # Check for RAM patterns (requires repacking)
             for pattern in RAM_PATTERNS:
                 if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "RAM"
+
+            # Check for MRA patterns (requires repacking)
+            for pattern in MRA_PATTERNS:
+                if pattern_matches_full_word(tex_name, pattern.lower()):
+                    return "MRA"
 
         return "STANDARD"
     
@@ -414,26 +432,29 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         textures: list,
         patterns: dict = None,
         include_orm: bool = False,
-        context_names: List[str] = None
+        context_names: List[str] = None,
+        packing_mode: str = None
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Categorize all textures, keeping ALL candidates per type.
-    
+
         Unlike match_texture_to_type which returns only the first match,
         this function collects ALL textures that match each type.
-    
+
         Confidence scoring:
         - Base confidence: 1.0 if only one texture matches the channel, else 1.0 / num_matches
         - Name bonus: +0.3 if texture name contains any of the context names (mesh/material/slot)
         - Results sorted by confidence descending
         - Auto-select the highest confidence texture if >= 1.0
-    
+
         Args:
             textures: List of texture assets to categorize
             patterns: Texture type patterns dict (default: DEFAULT_PATTERNS)
-            include_orm: If True, also check for ORM packed texture patterns
+            include_orm: If True, also check for ORM packed texture patterns (legacy)
             context_names: Optional list of context names (mesh name, material name, slot name)
                            used for confidence bonus when texture name contains them
-    
+            packing_mode: If provided, check for packed texture patterns matching this mode.
+                          Values: 'ORM', 'RMA', 'RAM', 'MRA'. Overrides include_orm if set.
+
         Returns:
             Dict mapping texture types to lists of candidate dicts:
             {
@@ -474,12 +495,29 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             tex_name_lower = tex_name.lower()
             matched_types = set()  # Track which types this texture matched
 
-            # Check for ORM patterns if enabled
-            if include_orm:
+            # Check for packed texture patterns based on packing_mode
+            # Map packing mode to pattern list
+            packed_pattern_map = {
+                'ORM': ORM_PATTERNS,
+                'RMA': RMA_PATTERNS,
+                'RAM': RAM_PATTERNS,
+                'MRA': MRA_PATTERNS,
+            }
+
+            # Check for patterns matching the detected packing mode
+            # Always store as 'ORM' since that's the target format (RMA/RAM/MRA will be repacked to ORM)
+            if packing_mode and packing_mode in packed_pattern_map:
+                pattern_list = packed_pattern_map[packing_mode]
+                for pattern in pattern_list:
+                    if pattern_matches_full_word(tex_name_lower, pattern.lower()):
+                        matched_types.add('ORM')  # Always use ORM as the channel name
+                        break
+            # Legacy support: include_orm flag
+            elif include_orm:
                 for pattern in ORM_PATTERNS:
                     if pattern_matches_full_word(tex_name_lower, pattern.lower()):
                         matched_types.add('ORM')
-                        break  # Only need one ORM pattern match
+                        break
 
             # Check ALL standard patterns (don't skip after first match)
             for tex_type, pattern_list in patterns.items():
@@ -525,11 +563,13 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             if tex_list and tex_list[0]['confidence'] >= 1.0:
                 tex_list[0]['selected'] = True
 
-        # If ORM texture is detected with high confidence, skip Roughness, Metallic, and AO
-        # since ORM already contains all three channels
+        # If a packed texture (ORM) is detected, always remove Roughness, Metallic, and AO
+        # since packed textures contain all three channels.
+        # Note: RMA/RAM/MRA textures are also stored under 'ORM' key (target format)
         if 'ORM' in candidates:
             orm_list = candidates['ORM']
-            if orm_list and orm_list[0]['confidence'] >= 1.0:
+            if orm_list:
+                # Always remove individual channels when a packed texture exists
                 for channel in ['Roughness', 'Metallic', 'AO']:
                     if channel in candidates:
                         del candidates[channel]
@@ -566,10 +606,11 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         master_material_orm,
         slot_index: int,
         slot_name: str,
-        mesh_name: str
+        mesh_name: str,
+        swizzle_material_path: str = None
     ) -> Dict[str, Any]:
         """Analyze a single material slot for texture conflicts.
-    
+
         Args:
             slot_material: The material in this slot
             master_material: Standard master material
@@ -577,7 +618,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             slot_index: Slot index
             slot_name: Slot name
             mesh_name: Name of the mesh (for confidence scoring)
-    
+            swizzle_material_path: If provided, enables texture repacking for
+                incompatible formats (RMA, RAM, MRA) instead of skipping them
+
         Returns:
             SlotAnalysis dict
         """
@@ -599,7 +642,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             'has_conflicts': False,
             'conflict_types': [],
             'skipped_channels': {},
-            'total_issues': 0
+            'total_issues': 0,
+            'needs_repack': False
         }
 
         if not slot_material:
@@ -618,18 +662,24 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         packing_mode = BPMaterialOptimizer.detect_texture_packing_mode(raw_textures)
         slot_analysis['packing_mode'] = packing_mode
 
-        if packing_mode == 'RMA':
-            slot_analysis['skip_reason'] = 'RMA packed textures (incompatible channel order)'
-            slot_analysis['total_issues'] = 1  # Incompatibility issue
-            return slot_analysis
-
-        if packing_mode == 'RAM':
-            slot_analysis['skip_reason'] = 'RAM packed textures (incompatible channel order)'
-            slot_analysis['total_issues'] = 1  # Incompatibility issue
-            return slot_analysis
-
+        # Handle incompatible packing formats (RMA, RAM, MRA)
+        if packing_mode in ['RMA', 'RAM', 'MRA']:
+            if swizzle_material_path:
+                # Repacking enabled - mark for conversion, continue processing
+                slot_analysis['needs_repack'] = True
+                # Will use ORM master material for the converted texture
+                if not master_material_orm:
+                    slot_analysis['skip_reason'] = f'{packing_mode} textures - repacking enabled but no ORM master material provided'
+                    slot_analysis['total_issues'] = 1
+                    return slot_analysis
+                selected_master = master_material_orm
+            else:
+                # No swizzle material - treat as incompatible (original behavior)
+                slot_analysis['skip_reason'] = f'{packing_mode} packed textures (incompatible channel order)'
+                slot_analysis['total_issues'] = 1
+                return slot_analysis
         # Select master material based on packing mode
-        if packing_mode == 'ORM':
+        elif packing_mode == 'ORM':
             if not master_material_orm:
                 slot_analysis['skip_reason'] = 'ORM textures detected but no ORM material provided'
                 slot_analysis['total_issues'] = 1  # Incompatibility issue
@@ -647,10 +697,14 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             return slot_analysis
     
         # Get all texture candidates with context for confidence scoring
-        include_orm = (packing_mode == 'ORM')
         material_name = slot_material.get_name() if slot_material else None
         context_names = [mesh_name, material_name, slot_name]
-        candidates = BPMaterialOptimizer.get_all_texture_candidates(raw_textures, include_orm=include_orm, context_names=context_names)
+        # Pass packing_mode to capture packed textures (ORM, RMA, RAM, MRA)
+        candidates = BPMaterialOptimizer.get_all_texture_candidates(
+            raw_textures,
+            context_names=context_names,
+            packing_mode=packing_mode if packing_mode != 'STANDARD' else None
+        )
     
         slot_analysis['texture_matches'] = candidates
     
@@ -679,15 +733,18 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     def _analyze_mesh(
         mesh: unreal.StaticMesh,
         master_material,
-        master_material_orm
+        master_material_orm,
+        swizzle_material_path: str = None
     ) -> Dict[str, Any]:
         """Analyze a single mesh for texture conflicts.
-    
+
         Args:
             mesh: The static mesh to analyze
             master_material: Standard master material
             master_material_orm: ORM master material (optional)
-    
+            swizzle_material_path: If provided, enables texture repacking for
+                incompatible formats (RMA, RAM, MRA) instead of skipping them
+
         Returns:
             MeshAnalysis dict
         """
@@ -717,7 +774,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 master_material_orm,
                 slot['index'],
                 slot['slot_name'],
-                mesh_name
+                mesh_name,
+                swizzle_material_path
             )
             mesh_analysis['slots'].append(slot_analysis)
 
@@ -773,6 +831,231 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             unreal.log_error(f"  Failed to create folder: {folder_path}")
 
         return success
+
+    # Texture properties to preserve when repacking
+    TEXTURE_SETTINGS_TO_PRESERVE = [
+        'LODBias',
+        'MaxTextureSize',
+        'AdjustBrightness',
+        'AdjustBrightnessCurve',
+        'AdjustVibrance',
+        'AdjustSaturation',
+        'AdjustRGBCurve',
+        'AdjustHue',
+        'AdjustMinAlpha',
+        'AdjustMaxAlpha',
+    ]
+
+    # Default values for texture settings (used when resetting for clean render)
+    TEXTURE_SETTINGS_DEFAULTS = {
+        'LODBias': 0,
+        'MaxTextureSize': 0,
+        'AdjustBrightness': 1.0,
+        'AdjustBrightnessCurve': 1.0,
+        'AdjustVibrance': 0.0,
+        'AdjustSaturation': 1.0,
+        'AdjustRGBCurve': 1.0,
+        'AdjustHue': 0.0,
+        'AdjustMinAlpha': 0.0,
+        'AdjustMaxAlpha': 1.0,
+    }
+
+    @staticmethod
+    def repack_texture_gpu(
+        source_texture: unreal.Texture2D,
+        swizzle_material_path: str,
+        output_path: str,
+        output_name: str
+    ) -> Optional[unreal.Texture2D]:
+        """Repack a packed texture using GPU rendering via a swizzle material instance.
+
+        This function is format-agnostic - the swizzle material defines the
+        channel remapping. This makes it reusable for any packing format
+        (RMA, RAM, MRA, or custom exotic formats).
+
+        Handles virtual textures and preserves texture settings like LODBias,
+        MaxTextureSize, and color adjustments.
+
+        Requires EUO_TextureRepacker Editor Utility Object to be present
+        in /Game/__AssetTools/.
+
+        Args:
+            source_texture: The packed texture to repack
+            swizzle_material_path: Path to a MaterialInstance with a "SourceTexture"
+                texture parameter. The MI defines the channel swizzle logic.
+            output_path: Content path for output (e.g., "/Game/Textures/__Repacked")
+            output_name: Name for the new texture (e.g., "T_Wood_ORM")
+
+        Returns:
+            The newly created texture, or None on failure
+        """
+        if not swizzle_material_path:
+            unreal.log_error("repack_texture_gpu: swizzle_material_path is required")
+            return None
+
+        if not source_texture:
+            unreal.log_error("repack_texture_gpu: source_texture is required")
+            return None
+
+        # Get source dimensions
+        width = source_texture.blueprint_get_size_x()
+        height = source_texture.blueprint_get_size_y()
+
+        # Save texture settings to preserve (will be applied to output)
+        saved_settings = {}
+        for prop in BPMaterialOptimizer.TEXTURE_SETTINGS_TO_PRESERVE:
+            try:
+                saved_settings[prop] = source_texture.get_editor_property(prop)
+            except:
+                pass  # Property might not exist on this texture type
+
+        # Check if source is a virtual texture
+        is_virtual_texture = False
+        try:
+            is_virtual_texture = source_texture.get_editor_property('VirtualTextureStreaming')
+        except:
+            pass
+
+        # Determine if we need a temp copy by checking all settings that affect rendering
+        # We only copy if settings differ from defaults (to avoid slow asset duplication)
+        needs_temp_copy = is_virtual_texture  # Virtual textures always need conversion
+
+        if not needs_temp_copy:
+            # Check if any setting differs from default
+            for prop, default_val in BPMaterialOptimizer.TEXTURE_SETTINGS_DEFAULTS.items():
+                current_val = saved_settings.get(prop)
+                if current_val is not None and current_val != default_val:
+                    needs_temp_copy = True
+                    break
+
+        temp_texture = None
+        temp_texture_path = None
+        render_texture = source_texture  # Texture to use for rendering
+
+        if needs_temp_copy:
+            # Duplicate source texture to temp location
+            unreal.log(f"    Creating temp copy (non-default settings detected)")
+            source_path = source_texture.get_path_name().rsplit('.', 1)[0]
+            temp_folder = "/Game/__Temp"
+            temp_texture_name = f"TEMP_{source_texture.get_name()}"
+            temp_texture_path = f"{temp_folder}/{temp_texture_name}"
+
+            BPMaterialOptimizer.ensure_folder_exists(temp_folder)
+
+            # Delete existing temp texture if present
+            if unreal.EditorAssetLibrary.does_asset_exist(temp_texture_path):
+                unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+
+            # Duplicate
+            if not unreal.EditorAssetLibrary.duplicate_asset(source_path, temp_texture_path):
+                unreal.log_error(f"repack_texture_gpu: Failed to duplicate texture to {temp_texture_path}")
+                return None
+
+            temp_texture = unreal.EditorAssetLibrary.load_asset(temp_texture_path)
+            if not temp_texture:
+                unreal.log_error(f"repack_texture_gpu: Failed to load duplicated texture")
+                return None
+
+            # If virtual texture, convert to regular texture first
+            # (this resets some settings, so we do it before resetting to defaults)
+            if is_virtual_texture:
+                temp_texture.set_editor_property('VirtualTextureStreaming', False)
+
+            # Reset settings to defaults for clean rendering
+            for prop, default_val in BPMaterialOptimizer.TEXTURE_SETTINGS_DEFAULTS.items():
+                try:
+                    temp_texture.set_editor_property(prop, default_val)
+                except:
+                    pass
+
+            # Disable streaming to ensure full resolution mips are loaded
+            temp_texture.set_editor_property('NeverStream', True)
+
+            # Save the temp texture with updated settings
+            unreal.EditorAssetLibrary.save_asset(temp_texture_path)
+
+            # Force mip levels to be resident and wait for streaming to complete
+            temp_texture.set_force_mip_levels_to_be_resident(10.0, 0)
+
+            render_texture = temp_texture
+        else:
+            # No copy needed - just ensure mips are loaded for rendering
+            source_texture.set_force_mip_levels_to_be_resident(10.0, 0)
+
+        # Load swizzle material instance
+        swizzle_mi = unreal.EditorAssetLibrary.load_asset(swizzle_material_path)
+        if not swizzle_mi:
+            unreal.log_error(f"repack_texture_gpu: Swizzle material not found: {swizzle_material_path}")
+            # Cleanup temp texture
+            if temp_texture_path:
+                unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+            return None
+
+        if not isinstance(swizzle_mi, unreal.MaterialInstance):
+            unreal.log_error(f"repack_texture_gpu: Expected MaterialInstance, got {type(swizzle_mi).__name__}")
+            if temp_texture_path:
+                unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+            return None
+
+        # Set source texture parameter on the swizzle MI (use clean render_texture)
+        unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+            swizzle_mi, "SourceTexture", render_texture
+        )
+
+        # Call Editor Utility Object to render material to texture
+        # (KismetRenderingLibrary is not exposed to Python, so we use a BP wrapper)
+        euo_path = "/Game/__AssetTools/EUO_TextureRepacker.EUO_TextureRepacker_C"
+        euo_class = unreal.load_object(None, euo_path)
+        if not euo_class:
+            unreal.log_error(f"repack_texture_gpu: Could not load EUO_TextureRepacker at {euo_path}")
+            if temp_texture_path:
+                unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+            return None
+
+        # Get the default object to call methods
+        euo_instance = unreal.get_default_object(euo_class)
+        if not euo_instance:
+            unreal.log_error("repack_texture_gpu: Could not get EUO_TextureRepacker default object")
+            if temp_texture_path:
+                unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+            return None
+
+        # Call the Blueprint function
+        success, new_texture = euo_instance.call_method("RepackTexture", args=(swizzle_mi, width, height, output_name,))
+
+        # Cleanup temp texture
+        if temp_texture_path:
+            unreal.EditorAssetLibrary.delete_asset(temp_texture_path)
+
+        if not success or not new_texture:
+            unreal.log_error("repack_texture_gpu: EUO_TextureRepacker.RepackTexture failed")
+            return None
+
+        # Force DXT1 compression (no alpha) instead of DXT5
+        new_texture.set_editor_property("CompressionNoAlpha", True)
+
+        # Apply saved settings to the new texture
+        for prop, value in saved_settings.items():
+            try:
+                new_texture.set_editor_property(prop, value)
+            except:
+                pass
+
+        # Move to output folder
+        current_path = new_texture.get_path_name().rsplit('.', 1)[0]
+        target_path = f"{output_path}/{output_name}"
+
+        # Ensure output folder exists
+        BPMaterialOptimizer.ensure_folder_exists(output_path)
+
+        unreal.EditorAssetLibrary.rename_asset(current_path, target_path)
+        unreal.EditorAssetLibrary.save_asset(target_path)
+
+        # Reload from new location
+        new_texture = unreal.EditorAssetLibrary.load_asset(target_path)
+        unreal.log(f"    Created repacked texture: {target_path}")
+
+        return new_texture
 
 
     # =============================================================================
@@ -1232,10 +1515,11 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         return True
 
 
-    @unreal.ufunction(static=True, params=[str, str], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str], ret=str, meta=dict(Category="Material Optimizer"))
     def analyze_selected_meshes(
         master_material_path: str,
-        master_material_orm_path: str
+        master_material_orm_path: str,
+        swizzle_material_path: str = ""
     ) -> str:
         """Analyze selected static meshes and return a JSON report of their materials and textures.
 
@@ -1245,7 +1529,7 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
 
         The analysis examines each mesh's material slots, finds texture dependencies,
         categorizes textures by type (BaseColor, Normal, Roughness, etc.), detects
-        ORM/ARM/RMA packing modes, and calculates confidence scores for texture matches.
+        ORM/ARM/RMA/RAM/MRA packing modes, and calculates confidence scores for texture matches.
 
         Args:
             master_material_path: Content path to the standard master material
@@ -1253,6 +1537,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             master_material_orm_path: Content path to the ORM variant master material
                 (e.g., "/Game/Materials/M_Master_ORM"). Pass empty string if not using ORM.
                 Required only if meshes use ORM/ARM packed textures.
+            swizzle_material_path: Content path to a swizzle material for repacking textures.
+                If provided, enables automatic texture repacking for incompatible formats
+                (RMA, RAM, MRA) to ORM. Pass empty string to disable repacking (default).
 
         Returns:
             JSON string with the following structure:
@@ -1335,7 +1622,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         }
 
         for mesh in meshes:
-            mesh_analysis = BPMaterialOptimizer._analyze_mesh(mesh, master_material, master_material_orm)
+            mesh_analysis = BPMaterialOptimizer._analyze_mesh(
+                mesh, master_material, master_material_orm, swizzle_material_path
+            )
             result['meshes'].append(mesh_analysis)
 
             # Sum up mesh issues (which includes all slot issues)
@@ -1351,13 +1640,14 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         unreal.log(f"Analysis complete: {len(meshes)} meshes, {result['total_issues']} issues")
         return json.dumps(result)
     
-    @unreal.ufunction(static=True, params=[str, str, str, str, bool], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str, str, bool, str], ret=str, meta=dict(Category="Material Optimizer"))
     def optimize_materials_from_analysis(
         analysis_json: str,
         master_material_path: str,
         master_material_orm_path: str,
         output_folder: str,
-        overwrite: bool
+        overwrite: bool,
+        swizzle_material_path: str = ""
     ) -> str:
         """Process meshes and create Material Instances based on analysis results.
 
@@ -1373,7 +1663,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         For each compatible material slot, this function:
         1. Creates a new MaterialInstanceConstant parented to the master material
         2. Assigns textures to the appropriate material parameters
-        3. Assigns the new MI to the mesh's material slot
+        3. Repacks textures (if swizzle_material_path is provided and slot needs_repack)
+        4. Assigns the new MI to the mesh's material slot
 
         Skipping Logic:
         - Meshes with 'skip': true are skipped entirely
@@ -1393,6 +1684,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 (e.g., "/Game/Materials/Instances"). Pass empty string to save next to mesh.
             overwrite: If true, existing Material Instances with the same name will be
                 deleted and recreated. If false, existing MIs are reused without modification.
+            swizzle_material_path: Content path to a swizzle material for repacking textures.
+                If provided, textures in slots marked with needs_repack=True will be repacked
+                using this material. Pass empty string to disable repacking (default).
 
         Returns:
             JSON string with processing results:
@@ -1527,24 +1821,87 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                     if not matched:
                         unreal.log_warning(f"  {slot_label} SKIPPED: No textures selected")
                         continue
-    
+
+                    # Handle texture repacking if needed
+                    needs_repack = slot_data.get('needs_repack', False)
+                    if needs_repack and swizzle_material_path:
+                        # The packed texture is stored under 'ORM' key (target format)
+                        # regardless of source format (RMA, RAM, MRA)
+                        packed_tex = matched.get('ORM')
+
+                        if packed_tex:
+                            # Determine output location for repacked texture
+                            repack_folder = f"{output_folder}/__Repacked" if output_folder else "/Game/__Repacked"
+
+                            # Generate name by replacing the matched pattern with _ORM
+                            source_name = packed_tex.get_name()
+                            output_name = source_name
+
+                            # Get the pattern list for the detected packing mode
+                            pattern_map = {
+                                'RMA': RMA_PATTERNS,
+                                'RAM': RAM_PATTERNS,
+                                'MRA': MRA_PATTERNS,
+                            }
+                            patterns = pattern_map.get(packing_mode, [])
+
+                            # Find and replace the matched pattern with _ORM
+                            for pattern in patterns:
+                                if pattern.lower() in source_name.lower():
+                                    # Find the actual case-preserved pattern in the name
+                                    idx = source_name.lower().find(pattern.lower())
+                                    if idx != -1:
+                                        original_pattern = source_name[idx:idx + len(pattern)]
+                                        output_name = source_name[:idx] + '_ORM' + source_name[idx + len(pattern):]
+                                        break
+
+                            # Check if already repacked
+                            target_path = f"{repack_folder}/{output_name}"
+                            if not overwrite and unreal.EditorAssetLibrary.does_asset_exist(target_path):
+                                repacked_texture = unreal.EditorAssetLibrary.load_asset(target_path)
+                                unreal.log(f"    Using existing repacked texture: {target_path}")
+                            else:
+                                unreal.log(f"    Repacking {packing_mode} texture: {source_name}")
+                                repacked_texture = BPMaterialOptimizer.repack_texture_gpu(
+                                    packed_tex,
+                                    swizzle_material_path,
+                                    repack_folder,
+                                    output_name
+                                )
+
+                            if repacked_texture:
+                                # Replace the packed texture with repacked version in matched dict
+                                matched['ORM'] = repacked_texture
+                                # Remove individual channels - the ORM texture contains all of them
+                                for channel in ['Roughness', 'Metallic', 'AO']:
+                                    if channel in matched:
+                                        del matched[channel]
+                                # Update packing_mode for master material selection
+                                packing_mode = 'ORM'
+                            else:
+                                unreal.log_warning(f"  {slot_label} SKIPPED: Failed to repack texture")
+                                continue
+
                     # Find the actual slot material
                     slot = None
                     for s in material_slots:
                         if s['index'] == slot_index:
                             slot = s
                             break
-    
+
                     if not slot or not slot['material']:
                         unreal.log_warning(f"  {slot_label} SKIPPED: No material in slot")
                         continue
-    
+
                     slot_material = slot['material']
-    
+
                     # Select master material based on packing mode
-                    if packing_mode == 'ORM':
+                    # Note: After repacking, packing_mode is updated to 'ORM'
+                    if packing_mode in ['ORM', 'RMA', 'RAM', 'MRA']:
+                        # RMA/RAM/MRA without repacking shouldn't reach here (handled in analysis),
+                        # but if they do, use ORM material since repacking converts to ORM
                         if not master_material_orm:
-                            unreal.log_warning(f"  {slot_label} SKIPPED: ORM textures but no ORM material")
+                            unreal.log_warning(f"  {slot_label} SKIPPED: {packing_mode} textures but no ORM material")
                             continue
                         selected_master = master_material_orm
                         param_names = MATERIAL_PARAMETER_NAMES_ORM
