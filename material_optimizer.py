@@ -380,6 +380,68 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     
     
     # =============================================================================
+    # Virtual Texture Detection
+    # =============================================================================
+    @staticmethod
+    def detect_texture_vt_status(textures: list) -> Dict[str, Any]:
+        """Check Virtual Texture (VT) status of a list of textures.
+
+        Examines each texture to determine if it uses Virtual Texture streaming.
+        This information is used for compatibility checking with master materials
+        that may or may not support VT samplers.
+
+        Args:
+            textures: List of texture assets to examine
+
+        Returns:
+            Dict with VT status information:
+            {
+                'has_vt': bool,           # At least one texture is VT
+                'has_non_vt': bool,       # At least one texture is non-VT
+                'all_vt': bool,           # All textures are VT
+                'all_non_vt': bool,       # All textures are non-VT
+                'vt_textures': list,      # List of VT texture paths
+                'non_vt_textures': list,  # List of non-VT texture paths
+            }
+        """
+        vt_textures = []
+        non_vt_textures = []
+
+        for texture in textures:
+            if not texture:
+                continue
+
+            # Get texture path for reporting
+            tex_path = texture.get_path_name()
+            if '.' in tex_path:
+                tex_path = tex_path.split('.')[0]
+
+            # Check VT status
+            is_vt = False
+            try:
+                is_vt = texture.get_editor_property('VirtualTextureStreaming')
+            except:
+                pass  # Property might not exist on some texture types
+
+            if is_vt:
+                vt_textures.append(tex_path)
+            else:
+                non_vt_textures.append(tex_path)
+
+        has_vt = len(vt_textures) > 0
+        has_non_vt = len(non_vt_textures) > 0
+        total = len(vt_textures) + len(non_vt_textures)
+
+        return {
+            'has_vt': has_vt,
+            'has_non_vt': has_non_vt,
+            'all_vt': has_vt and not has_non_vt and total > 0,
+            'all_non_vt': has_non_vt and not has_vt and total > 0,
+            'vt_textures': vt_textures,
+            'non_vt_textures': non_vt_textures,
+        }
+
+    # =============================================================================
     # ORM/ARM Packing Detection
     # =============================================================================
     @staticmethod
@@ -607,7 +669,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         slot_index: int,
         slot_name: str,
         mesh_name: str,
-        swizzle_material_path: str = None
+        swizzle_material_path: str = None,
+        master_material_supports_vt: bool = False,
+        master_material_orm_supports_vt: bool = False,
+        convert_vt_textures: bool = False
     ) -> Dict[str, Any]:
         """Analyze a single material slot for texture conflicts.
 
@@ -620,6 +685,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             mesh_name: Name of the mesh (for confidence scoring)
             swizzle_material_path: If provided, enables texture repacking for
                 incompatible formats (RMA, RAM, MRA) instead of skipping them
+            master_material_supports_vt: Whether the standard master material supports VT
+            master_material_orm_supports_vt: Whether the ORM master material supports VT
+            convert_vt_textures: If True, VT mismatches won't be flagged as incompatible
 
         Returns:
             SlotAnalysis dict
@@ -643,7 +711,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             'conflict_types': [],
             'skipped_channels': {},
             'total_issues': 0,
-            'needs_repack': False
+            'needs_repack': False,
+            'vt_status': {},
+            'needs_vt_conversion': False,
+            'vt_conversion_direction': None
         }
 
         if not slot_material:
@@ -695,7 +766,39 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             slot_analysis['skip_reason'] = f'Incompatible: {reason}'
             slot_analysis['total_issues'] = 1  # Incompatibility issue
             return slot_analysis
-    
+
+        # Detect VT status of textures
+        vt_status = BPMaterialOptimizer.detect_texture_vt_status(raw_textures)
+        slot_analysis['vt_status'] = vt_status
+
+        # Determine which VT flag to use based on selected master material
+        # If using ORM master (packed textures), use ORM VT flag; otherwise use standard
+        if packing_mode in ['ORM', 'RMA', 'RAM', 'MRA']:
+            material_supports_vt = master_material_orm_supports_vt
+        else:
+            material_supports_vt = master_material_supports_vt
+
+        # Check VT compatibility
+        # Case 1: Material supports VT but all textures are non-VT -> need to convert to VT
+        if material_supports_vt and vt_status['all_non_vt']:
+            slot_analysis['needs_vt_conversion'] = True
+            slot_analysis['vt_conversion_direction'] = 'to_vt'
+        # Case 2: Material doesn't support VT but has VT textures -> need to convert to non-VT
+        elif not material_supports_vt and vt_status['has_vt']:
+            slot_analysis['needs_vt_conversion'] = True
+            slot_analysis['vt_conversion_direction'] = 'to_non_vt'
+
+        # If VT conversion is needed but not enabled, mark as incompatible
+        if slot_analysis['needs_vt_conversion'] and not convert_vt_textures:
+            direction = slot_analysis['vt_conversion_direction']
+            if direction == 'to_vt':
+                slot_analysis['skip_reason'] = 'VT mismatch: master material requires Virtual Textures but source textures are non-VT'
+            else:
+                slot_analysis['skip_reason'] = 'VT mismatch: master material does not support Virtual Textures but source textures are VT'
+            slot_analysis['is_compatible'] = False
+            slot_analysis['total_issues'] = 1
+            return slot_analysis
+
         # Get all texture candidates with context for confidence scoring
         material_name = slot_material.get_name() if slot_material else None
         context_names = [mesh_name, material_name, slot_name]
@@ -734,7 +837,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         mesh: unreal.StaticMesh,
         master_material,
         master_material_orm,
-        swizzle_material_path: str = None
+        swizzle_material_path: str = None,
+        master_material_supports_vt: bool = False,
+        master_material_orm_supports_vt: bool = False,
+        convert_vt_textures: bool = False
     ) -> Dict[str, Any]:
         """Analyze a single mesh for texture conflicts.
 
@@ -744,6 +850,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             master_material_orm: ORM master material (optional)
             swizzle_material_path: If provided, enables texture repacking for
                 incompatible formats (RMA, RAM, MRA) instead of skipping them
+            master_material_supports_vt: Whether the standard master material supports VT
+            master_material_orm_supports_vt: Whether the ORM master material supports VT
+            convert_vt_textures: If True, VT mismatches won't be flagged as incompatible
 
         Returns:
             MeshAnalysis dict
@@ -775,7 +884,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 slot['index'],
                 slot['slot_name'],
                 mesh_name,
-                swizzle_material_path
+                swizzle_material_path,
+                master_material_supports_vt,
+                master_material_orm_supports_vt,
+                convert_vt_textures
             )
             mesh_analysis['slots'].append(slot_analysis)
 
@@ -1054,6 +1166,88 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         # Reload from new location
         new_texture = unreal.EditorAssetLibrary.load_asset(target_path)
         unreal.log(f"    Created repacked texture: {target_path}")
+
+        return new_texture
+
+    @staticmethod
+    def convert_texture_vt_mode(
+        source_texture: unreal.Texture2D,
+        enable_vt: bool,
+        output_path: str,
+        output_name: str
+    ) -> Optional[unreal.Texture2D]:
+        """Convert a texture between Virtual Texture (VT) and non-VT modes.
+
+        Always creates a copy of the source texture - never modifies the original.
+        The copy is saved with the VirtualTextureStreaming property set appropriately.
+
+        VT textures require power-of-two dimensions, so converting to VT will fail
+        for non-power-of-two textures.
+
+        Args:
+            source_texture: The source texture to convert
+            enable_vt: True to enable VT streaming, False to disable
+            output_path: Content path for the output texture (e.g., "/Game/__VTConverted")
+            output_name: Name for the new texture (e.g., "T_Wood_BaseColor_NonVT")
+
+        Returns:
+            The newly created texture with modified VT setting, or None on failure
+        """
+        if not source_texture:
+            unreal.log_error("convert_texture_vt_mode: source_texture is required")
+            return None
+
+        # Get source dimensions for VT validation
+        width = source_texture.blueprint_get_size_x()
+        height = source_texture.blueprint_get_size_y()
+
+        # Validate power-of-two for VT conversion
+        if enable_vt:
+            is_power_of_two = (
+                width > 0 and (width & (width - 1)) == 0 and
+                height > 0 and (height & (height - 1)) == 0
+            )
+            if not is_power_of_two:
+                unreal.log_error(
+                    f"convert_texture_vt_mode: Cannot convert to VT - texture {source_texture.get_name()} "
+                    f"is not power-of-two ({width}x{height})"
+                )
+                return None
+
+        # Get source path
+        source_path = source_texture.get_path_name()
+        if '.' in source_path:
+            source_path = source_path.rsplit('.', 1)[0]
+
+        # Prepare target path
+        target_path = f"{output_path}/{output_name}"
+
+        # Ensure output folder exists
+        BPMaterialOptimizer.ensure_folder_exists(output_path)
+
+        # Delete existing asset if present
+        if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+            unreal.EditorAssetLibrary.delete_asset(target_path)
+
+        # Duplicate the texture
+        if not unreal.EditorAssetLibrary.duplicate_asset(source_path, target_path):
+            unreal.log_error(f"convert_texture_vt_mode: Failed to duplicate texture to {target_path}")
+            return None
+
+        # Load the duplicated texture
+        new_texture = unreal.EditorAssetLibrary.load_asset(target_path)
+        if not new_texture:
+            unreal.log_error(f"convert_texture_vt_mode: Failed to load duplicated texture from {target_path}")
+            return None
+
+        # Set VT mode
+        new_texture.set_editor_property('VirtualTextureStreaming', enable_vt)
+
+        # Save the texture with new VT setting
+        unreal.EditorAssetLibrary.save_asset(target_path)
+
+        vt_mode_str = "VT" if enable_vt else "non-VT"
+        unreal.log(f"    Created {vt_mode_str} texture: {target_path}")
 
         return new_texture
 
@@ -1515,11 +1709,14 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         return True
 
 
-    @unreal.ufunction(static=True, params=[str, str, str], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str, bool, bool, bool], ret=str, meta=dict(Category="Material Optimizer"))
     def analyze_selected_meshes(
         master_material_path: str,
         master_material_orm_path: str,
-        swizzle_material_path: str = ""
+        swizzle_material_path: str = "",
+        master_material_supports_vt: bool = False,
+        master_material_orm_supports_vt: bool = False,
+        convert_vt_textures: bool = False
     ) -> str:
         """Analyze selected static meshes and return a JSON report of their materials and textures.
 
@@ -1540,6 +1737,15 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             swizzle_material_path: Content path to a swizzle material for repacking textures.
                 If provided, enables automatic texture repacking for incompatible formats
                 (RMA, RAM, MRA) to ORM. Pass empty string to disable repacking (default).
+            master_material_supports_vt: Whether the standard master material supports
+                Virtual Textures. If True and source textures are non-VT, conversion may
+                be needed. If False and source textures are VT, conversion may be needed.
+            master_material_orm_supports_vt: Whether the ORM master material supports
+                Virtual Textures. Same logic as master_material_supports_vt.
+            convert_vt_textures: If True, VT mismatches between textures and master materials
+                will NOT be flagged as incompatible (since they will be auto-converted during
+                processing). If False (default), VT mismatches are flagged as incompatible
+                and counted as issues requiring user attention.
 
         Returns:
             JSON string with the following structure:
@@ -1565,7 +1771,17 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                                 "has_conflicts": bool,
                                 "conflict_types": [str],
                                 "skipped_channels": {"BaseColor": false, ...},
-                                "total_issues": int
+                                "total_issues": int,
+                                "vt_status": {              // Virtual texture status
+                                    "has_vt": bool,         // At least one texture is VT
+                                    "has_non_vt": bool,     // At least one texture is non-VT
+                                    "all_vt": bool,
+                                    "all_non_vt": bool,
+                                    "vt_textures": [str],   // Paths of VT textures
+                                    "non_vt_textures": [str]
+                                },
+                                "needs_vt_conversion": bool,    // True if VT mismatch detected
+                                "vt_conversion_direction": str or null  // "to_vt" or "to_non_vt"
                             }
                         ],
                         "has_any_conflicts": bool,
@@ -1623,7 +1839,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
 
         for mesh in meshes:
             mesh_analysis = BPMaterialOptimizer._analyze_mesh(
-                mesh, master_material, master_material_orm, swizzle_material_path
+                mesh, master_material, master_material_orm, swizzle_material_path,
+                master_material_supports_vt, master_material_orm_supports_vt,
+                convert_vt_textures
             )
             result['meshes'].append(mesh_analysis)
 
@@ -1640,14 +1858,15 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         unreal.log(f"Analysis complete: {len(meshes)} meshes, {result['total_issues']} issues")
         return json.dumps(result)
     
-    @unreal.ufunction(static=True, params=[str, str, str, str, bool, str], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str, str, bool, str, bool], ret=str, meta=dict(Category="Material Optimizer"))
     def optimize_materials_from_analysis(
         analysis_json: str,
         master_material_path: str,
         master_material_orm_path: str,
         output_folder: str,
         overwrite: bool,
-        swizzle_material_path: str = ""
+        swizzle_material_path: str = "",
+        convert_vt_textures: bool = False
     ) -> str:
         """Process meshes and create Material Instances based on analysis results.
 
@@ -1687,6 +1906,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             swizzle_material_path: Content path to a swizzle material for repacking textures.
                 If provided, textures in slots marked with needs_repack=True will be repacked
                 using this material. Pass empty string to disable repacking (default).
+            convert_vt_textures: If True, automatically convert textures between VT and non-VT
+                modes to match the target master material's requirements. Conversion creates
+                copies in an __VTConverted folder. If False (default), VT mismatches are flagged
+                but not automatically resolved.
 
         Returns:
             JSON string with processing results:
@@ -1821,6 +2044,58 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                     if not matched:
                         unreal.log_warning(f"  {slot_label} SKIPPED: No textures selected")
                         continue
+
+                    # Handle VT conversion if needed
+                    needs_vt_conversion = slot_data.get('needs_vt_conversion', False)
+                    vt_conversion_direction = slot_data.get('vt_conversion_direction')
+
+                    if needs_vt_conversion:
+                        if convert_vt_textures:
+                            # Convert textures to match master material's VT requirements
+                            enable_vt = (vt_conversion_direction == 'to_vt')
+                            converted_folder = f"{output_folder}/__VTConverted" if output_folder else "/Game/__VTConverted"
+
+                            conversion_failed = False
+                            for tex_type, texture in list(matched.items()):
+                                # Check if this specific texture needs conversion
+                                is_vt = False
+                                try:
+                                    is_vt = texture.get_editor_property('VirtualTextureStreaming')
+                                except:
+                                    pass
+
+                                needs_conversion = (enable_vt and not is_vt) or (not enable_vt and is_vt)
+
+                                if needs_conversion:
+                                    suffix = "_VT" if enable_vt else "_NonVT"
+                                    converted_name = f"{texture.get_name()}{suffix}"
+
+                                    # Check if already converted
+                                    target_path = f"{converted_folder}/{converted_name}"
+                                    if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+                                        converted_tex = unreal.EditorAssetLibrary.load_asset(target_path)
+                                        unreal.log(f"    Using existing converted texture: {target_path}")
+                                    else:
+                                        unreal.log(f"    Converting {tex_type} texture to {'VT' if enable_vt else 'non-VT'}: {texture.get_name()}")
+                                        converted_tex = BPMaterialOptimizer.convert_texture_vt_mode(
+                                            texture, enable_vt, converted_folder, converted_name
+                                        )
+
+                                    if converted_tex:
+                                        matched[tex_type] = converted_tex
+                                    else:
+                                        unreal.log_warning(f"    Failed to convert {tex_type} texture VT mode")
+                                        conversion_failed = True
+                                        break
+
+                            if conversion_failed:
+                                unreal.log_warning(f"  {slot_label} SKIPPED: VT conversion failed")
+                                continue
+                        else:
+                            # VT conversion not enabled - skip slot
+                            direction_str = vt_conversion_direction.replace('_', ' ') if vt_conversion_direction else 'unknown'
+                            unreal.log_warning(f"  {slot_label} SKIPPED: VT mismatch (needs conversion {direction_str})")
+                            continue
 
                     # Handle texture repacking if needed
                     needs_repack = slot_data.get('needs_repack', False)
