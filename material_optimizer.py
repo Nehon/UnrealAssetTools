@@ -74,7 +74,7 @@ DEFAULT_PATTERNS = {
 }
 
 # Patterns for ORM/ARM packed textures (COMPATIBLE - same channel order: Occlusion/AO(R), Roughness(G), Metallic(B))
-ORM_PATTERNS = ["_ORM", "_ARM", "_OcclusionRoughnessMetallic", "_AORoughnessMetallic"]
+ORM_PATTERNS = ["_ORM", "_ARM", "_OcclusionRoughnessMetallic", "_AORoughnessMetallic","_MetalRough", "_HRM"]
 
 # Patterns for RMA packed textures (INCOMPATIBLE - different channel order: Roughness(R), Metallic(G), AO(B))
 RMA_PATTERNS = ["_RMA", "_RoughnessMetallicAO", "_RoughnessMetalAO"]
@@ -615,6 +615,14 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                         if ctx_name in tex_name_lower:
                             name_bonus = 0.3
                             break
+                        else:
+                            distance = BPMaterialOptimizer.levenshtein_distance(ctx_name, tex_name_lower)
+                            max_len = max(len(ctx_name), len(tex_name_lower))
+                            if max_len == 0:
+                                continue
+                            similarity = 1.0 - (distance / max_len)
+                            name_bonus += similarity * 0.01
+                            
     
                 tex_entry['confidence'] = base_confidence + name_bonus
     
@@ -2227,4 +2235,113 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             'skipped': skipped,
             'saved_count': len(assets_to_save)
         })
- 
+
+    @unreal.ufunction(static=True, params=[str, str, str, str, bool], ret=str, meta=dict(Category="Material Optimizer"))
+    def set_texture_selection(
+        json_analysis: str,
+        original_material: str,
+        channel_name: str,
+        texture_path: str,
+        checked: bool
+    ) -> str:
+        """Set the selected state of a specific texture in the analysis JSON.
+
+        Finds all material slots matching the original_material path, then locates
+        the texture matching texture_path within the specified channel, and sets
+        its 'selected' attribute to the given value. After updating the selection,
+        recomputes all issue counts at slot, mesh, and global levels.
+
+        Args:
+            json_analysis: The analysis JSON string from analyze_selected_meshes()
+            original_material: Material path to match against slot's source_material_path
+            channel_name: The texture channel name (e.g., "BaseColor", "Normal", "ORM")
+            texture_path: The texture path to match within the channel's texture list
+            checked: The boolean state to set for the texture's 'selected' attribute
+
+        Returns:
+            Modified JSON string with the updated texture selection state and recomputed issues
+        """
+        try:
+            data = json.loads(json_analysis)
+        except json.JSONDecodeError as e:
+            return json.dumps({'error': f'Invalid JSON: {str(e)}'})
+
+        meshes = data.get('meshes', [])
+
+        # Update the texture selection
+        for mesh in meshes:
+            slots = mesh.get('slots', [])
+
+            for slot in slots:
+                source_material_path = slot.get('source_material_path')
+
+                if source_material_path != original_material:
+                    continue
+
+                texture_matches = slot.get('texture_matches', {})
+                channel_textures = texture_matches.get(channel_name)
+
+                if not channel_textures:
+                    continue
+
+                for texture in channel_textures:
+                    if texture.get('path') == texture_path:
+                        texture['selected'] = checked
+
+        # Recompute issue counts at all levels
+        global_total_issues = 0
+        meshes_with_conflicts = 0
+
+        for mesh in meshes:
+            mesh_total_issues = 0
+            mesh_has_any_conflicts = False
+
+            for slot in mesh.get('slots', []):
+                # Skip incompatible slots (they keep their issue count of 1)
+                if not slot.get('is_compatible', False):
+                    continue
+
+                texture_matches = slot.get('texture_matches', {})
+                skipped_channels = slot.get('skipped_channels', {})
+
+                # Count unselected channels and recompute conflicts
+                unselected_channels = []
+                conflict_types = []
+
+                for tex_type, tex_list in texture_matches.items():
+                    # Skip channels marked as skipped by user
+                    if skipped_channels.get(tex_type, False):
+                        continue
+
+                    # Check for conflicts (multiple candidates)
+                    if len(tex_list) > 1:
+                        conflict_types.append(tex_type)
+
+                    # Check if any texture is selected for this channel
+                    has_selection = any(tex.get('selected', False) for tex in tex_list)
+                    if not has_selection:
+                        unselected_channels.append(tex_type)
+
+                # Update slot-level fields
+                slot['total_issues'] = len(unselected_channels)
+                slot['has_conflicts'] = len(conflict_types) > 0
+                slot['conflict_types'] = conflict_types
+
+                mesh_total_issues += slot['total_issues']
+                if slot['has_conflicts']:
+                    mesh_has_any_conflicts = True
+
+            # Update mesh-level fields
+            mesh['total_issues'] = mesh_total_issues
+            mesh['has_any_conflicts'] = mesh_has_any_conflicts
+
+            global_total_issues += mesh_total_issues
+            if mesh_has_any_conflicts:
+                meshes_with_conflicts += 1
+
+        # Update global fields
+        data['total_issues'] = global_total_issues
+        data['meshes_with_conflicts'] = meshes_with_conflicts
+        data['can_auto_process'] = global_total_issues == 0
+
+        return json.dumps(data)
