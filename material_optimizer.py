@@ -445,19 +445,22 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
     # ORM/ARM Packing Detection
     # =============================================================================
     @staticmethod
-    def detect_texture_packing_mode(textures: list) -> str:
+    def detect_texture_packing_mode(textures: list, custom_packed_prefix: str = None) -> str:
         """Detect if textures use ORM/ARM packing or separate channels.
 
         Examines texture names to determine which packing mode is used.
 
         Args:
             textures: List of texture assets to examine
+            custom_packed_prefix: Optional custom suffix pattern for packed textures
+                (e.g., "_MADS"). If a texture matches this suffix, returns "CUSTOM".
 
         Returns:
             "ORM" if ORM/ARM packed textures detected (compatible)
             "RMA" if RMA packed textures detected (requires repacking)
             "RAM" if RAM packed textures detected (requires repacking)
             "MRA" if MRA packed textures detected (requires repacking)
+            "CUSTOM" if custom packed textures detected (requires repacking)
             "STANDARD" if separate channel textures (no packed texture found)
         """
         for texture in textures:
@@ -483,6 +486,11 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 if pattern_matches_full_word(tex_name, pattern.lower()):
                     return "MRA"
 
+            # Check for custom packed prefix
+            if custom_packed_prefix:
+                if pattern_matches_full_word(tex_name, custom_packed_prefix.lower()):
+                    return "CUSTOM"
+
         return "STANDARD"
     
     
@@ -495,7 +503,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         patterns: dict = None,
         include_orm: bool = False,
         context_names: List[str] = None,
-        packing_mode: str = None
+        packing_mode: str = None,
+        custom_packed_prefix: str = None
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Categorize all textures, keeping ALL candidates per type.
 
@@ -515,7 +524,9 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             context_names: Optional list of context names (mesh name, material name, slot name)
                            used for confidence bonus when texture name contains them
             packing_mode: If provided, check for packed texture patterns matching this mode.
-                          Values: 'ORM', 'RMA', 'RAM', 'MRA'. Overrides include_orm if set.
+                          Values: 'ORM', 'RMA', 'RAM', 'MRA', 'CUSTOM'. Overrides include_orm if set.
+            custom_packed_prefix: Custom suffix pattern for packed textures (e.g., "_MADS").
+                          Used when packing_mode is 'CUSTOM'.
 
         Returns:
             Dict mapping texture types to lists of candidate dicts:
@@ -565,6 +576,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 'RAM': RAM_PATTERNS,
                 'MRA': MRA_PATTERNS,
             }
+            if custom_packed_prefix:
+                packed_pattern_map['CUSTOM'] = [custom_packed_prefix]
 
             # Check for patterns matching the detected packing mode
             # Always store as 'ORM' since that's the target format (RMA/RAM/MRA will be repacked to ORM)
@@ -680,7 +693,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         swizzle_material_path: str = None,
         master_material_supports_vt: bool = False,
         master_material_orm_supports_vt: bool = False,
-        convert_vt_textures: bool = False
+        convert_vt_textures: bool = False,
+        custom_packed_prefix: str = None
     ) -> Dict[str, Any]:
         """Analyze a single material slot for texture conflicts.
 
@@ -696,6 +710,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             master_material_supports_vt: Whether the standard master material supports VT
             master_material_orm_supports_vt: Whether the ORM master material supports VT
             convert_vt_textures: If True, VT mismatches won't be flagged as incompatible
+            custom_packed_prefix: Optional custom suffix pattern for packed textures
+                (e.g., "_MADS"). Enables detection of custom packed formats.
 
         Returns:
             SlotAnalysis dict
@@ -706,7 +722,7 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             source_material_path = slot_material.get_path_name()
             if '.' in source_material_path:
                 source_material_path = source_material_path.split('.')[0]
-    
+
         slot_analysis = {
             'slot_index': slot_index,
             'slot_name': slot_name,
@@ -738,11 +754,11 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             return slot_analysis
 
         # Detect packing mode
-        packing_mode = BPMaterialOptimizer.detect_texture_packing_mode(raw_textures)
+        packing_mode = BPMaterialOptimizer.detect_texture_packing_mode(raw_textures, custom_packed_prefix)
         slot_analysis['packing_mode'] = packing_mode
 
-        # Handle incompatible packing formats (RMA, RAM, MRA)
-        if packing_mode in ['RMA', 'RAM', 'MRA']:
+        # Handle incompatible packing formats (RMA, RAM, MRA, CUSTOM)
+        if packing_mode in ['RMA', 'RAM', 'MRA', 'CUSTOM']:
             if swizzle_material_path:
                 # Repacking enabled - mark for conversion, continue processing
                 slot_analysis['needs_repack'] = True
@@ -781,7 +797,7 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
 
         # Determine which VT flag to use based on selected master material
         # If using ORM master (packed textures), use ORM VT flag; otherwise use standard
-        if packing_mode in ['ORM', 'RMA', 'RAM', 'MRA']:
+        if packing_mode in ['ORM', 'RMA', 'RAM', 'MRA', 'CUSTOM']:
             material_supports_vt = master_material_orm_supports_vt
         else:
             material_supports_vt = master_material_supports_vt
@@ -814,7 +830,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         candidates = BPMaterialOptimizer.get_all_texture_candidates(
             raw_textures,
             context_names=context_names,
-            packing_mode=packing_mode if packing_mode != 'STANDARD' else None
+            packing_mode=packing_mode if packing_mode != 'STANDARD' else None,
+            custom_packed_prefix=custom_packed_prefix
         )
     
         slot_analysis['texture_matches'] = candidates
@@ -848,7 +865,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         swizzle_material_path: str = None,
         master_material_supports_vt: bool = False,
         master_material_orm_supports_vt: bool = False,
-        convert_vt_textures: bool = False
+        convert_vt_textures: bool = False,
+        custom_packed_prefix: str = None
     ) -> Dict[str, Any]:
         """Analyze a single mesh for texture conflicts.
 
@@ -857,10 +875,11 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             master_material: Standard master material
             master_material_orm: ORM master material (optional)
             swizzle_material_path: If provided, enables texture repacking for
-                incompatible formats (RMA, RAM, MRA) instead of skipping them
+                incompatible formats (RMA, RAM, MRA, CUSTOM) instead of skipping them
             master_material_supports_vt: Whether the standard master material supports VT
             master_material_orm_supports_vt: Whether the ORM master material supports VT
             convert_vt_textures: If True, VT mismatches won't be flagged as incompatible
+            custom_packed_prefix: Optional custom suffix pattern for packed textures
 
         Returns:
             MeshAnalysis dict
@@ -895,7 +914,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 swizzle_material_path,
                 master_material_supports_vt,
                 master_material_orm_supports_vt,
-                convert_vt_textures
+                convert_vt_textures,
+                custom_packed_prefix
             )
             mesh_analysis['slots'].append(slot_analysis)
 
@@ -1717,14 +1737,15 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         return True
 
 
-    @unreal.ufunction(static=True, params=[str, str, str, bool, bool, bool], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str, bool, bool, bool, str], ret=str, meta=dict(Category="Material Optimizer"))
     def analyze_selected_meshes(
         master_material_path: str,
         master_material_orm_path: str,
         swizzle_material_path: str = "",
         master_material_supports_vt: bool = False,
         master_material_orm_supports_vt: bool = False,
-        convert_vt_textures: bool = False
+        convert_vt_textures: bool = False,
+        custom_packed_prefix: str = ""
     ) -> str:
         """Analyze selected static meshes and return a JSON report of their materials and textures.
 
@@ -1754,6 +1775,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 will NOT be flagged as incompatible (since they will be auto-converted during
                 processing). If False (default), VT mismatches are flagged as incompatible
                 and counted as issues requiring user attention.
+            custom_packed_prefix: Optional suffix pattern for custom packed textures
+                (e.g., "_MADS"). When provided along with a swizzle_material_path, textures
+                matching this suffix will be detected as packed and repacked to ORM format.
+                Pass empty string to disable (default).
 
         Returns:
             JSON string with the following structure:
@@ -1849,7 +1874,7 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
             mesh_analysis = BPMaterialOptimizer._analyze_mesh(
                 mesh, master_material, master_material_orm, swizzle_material_path,
                 master_material_supports_vt, master_material_orm_supports_vt,
-                convert_vt_textures
+                convert_vt_textures, custom_packed_prefix or None
             )
             result['meshes'].append(mesh_analysis)
 
@@ -1866,7 +1891,7 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         unreal.log(f"Analysis complete: {len(meshes)} meshes, {result['total_issues']} issues")
         return json.dumps(result)
     
-    @unreal.ufunction(static=True, params=[str, str, str, str, bool, str, bool], ret=str, meta=dict(Category="Material Optimizer"))
+    @unreal.ufunction(static=True, params=[str, str, str, str, bool, str, bool, str], ret=str, meta=dict(Category="Material Optimizer"))
     def optimize_materials_from_analysis(
         analysis_json: str,
         master_material_path: str,
@@ -1874,7 +1899,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
         output_folder: str,
         overwrite: bool,
         swizzle_material_path: str = "",
-        convert_vt_textures: bool = False
+        convert_vt_textures: bool = False,
+        custom_packed_prefix: str = ""
     ) -> str:
         """Process meshes and create Material Instances based on analysis results.
 
@@ -1918,6 +1944,10 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                 modes to match the target master material's requirements. Conversion creates
                 copies in an __VTConverted folder. If False (default), VT mismatches are flagged
                 but not automatically resolved.
+            custom_packed_prefix: Optional suffix pattern for custom packed textures
+                (e.g., "_MADS"). When provided, textures with packing_mode "CUSTOM" will have
+                this suffix replaced with "_ORM" in the repacked output name.
+                Pass empty string to disable (default).
 
         Returns:
             JSON string with processing results:
@@ -2126,6 +2156,8 @@ class BPMaterialOptimizer(unreal.BlueprintFunctionLibrary):
                                 'RAM': RAM_PATTERNS,
                                 'MRA': MRA_PATTERNS,
                             }
+                            if custom_packed_prefix:
+                                pattern_map['CUSTOM'] = [custom_packed_prefix]
                             patterns = pattern_map.get(packing_mode, [])
 
                             # Find and replace the matched pattern with _ORM
